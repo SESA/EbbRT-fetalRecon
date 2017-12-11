@@ -106,7 +106,7 @@ class irtkReconstruction : public ebbrt::Messagable<irtkReconstruction>, public 
     irtkRealImage _confidenceMap;
 
     // Timer
-    struct timers _executionTimes;
+    phases_data _phase_performance;
 
   public:
     // Constructor
@@ -117,7 +117,9 @@ class irtkReconstruction : public ebbrt::Messagable<irtkReconstruction>, public 
       Create(ebbrt::EbbId id = ebbrt::ebb_allocator->Allocate());
 
     static irtkReconstruction& HandleFault(ebbrt::EbbId id);
-    ebbrt::Future<void> Ping(ebbrt::Messenger::NetworkId nid);
+
+    //ebbrt::Future<void> Ping(ebbrt::Messenger::NetworkId nid);
+    void Ping(ebbrt::Messenger::NetworkId nid);
 
     void ReceiveMessage(ebbrt::Messenger::NetworkId nid,
         std::unique_ptr<ebbrt::IOBuf>&& buffer);
@@ -252,9 +254,6 @@ class irtkReconstruction : public ebbrt::Messagable<irtkReconstruction>, public 
     void ReturnFromSliceToVolumeRegistration(Messenger::NetworkId nid);
     
     void ReturnFrom(int fn, ebbrt::Messenger::NetworkId frontEndNid);
-
-    // Timers
-    void InitializeTimers();
 
     void SendTimers(ebbrt::Messenger::NetworkId frontEndNid);
 

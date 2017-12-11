@@ -19,6 +19,9 @@
 #pragma GCC diagnostic ignored "-Wsign-compare"
 #pragma GCC diagnostic ignored "-Wunused-but-set-variable"
 
+// This is *IMPORTANT*, it allows the messenger to resolve remote HandleFaults
+EBBRT_PUBLISH_TYPE(, irtkReconstruction);
+
 EbbRef<irtkReconstruction> irtkReconstruction::Create(EbbId id) {
   return EbbRef<irtkReconstruction>(id);
 }
@@ -57,28 +60,16 @@ irtkReconstruction &irtkReconstruction::HandleFault(EbbId id) {
   return *rep;
 }
 
-ebbrt::Future<void> irtkReconstruction::Ping(Messenger::NetworkId nid) {
-  uint32_t id;
-  Promise<void> promise;
-  auto ret = promise.GetFuture();
-  {
-    std::lock_guard<std::mutex> guard(_m);
-    id = _id; // Get a new id (always even)
-    _id += 2;
+void irtkReconstruction::Ping(Messenger::NetworkId nid) {
 
-    bool inserted;
-    // insert our promise into the hash table
-    std::tie(std::ignore, inserted) =
-      _promise_map.emplace(id, std::move(promise));
-    assert(inserted);
-  }
   // Construct and send the ping message
-  auto buf = MakeUniqueIOBuf(sizeof(uint32_t));
+  auto buf = MakeUniqueIOBuf(sizeof(int));
   auto dp = buf->GetMutDataPointer();
-  dp.Get<uint32_t>() = id + 1; // Ping messages are odd
+
+  dp.Get<int>() = PING;
+
+  cout << "Sending Ping from CPU: " << ebbrt::Cpu::GetMine() << endl; 
   SendMessage(nid, std::move(buf));
-  std::printf("Ping SetMessage\n");
-  return ret;
 }
 
 void irtkReconstruction::SetDefaultParameters() {
@@ -163,10 +154,25 @@ ebbrt::Future<void> irtkReconstruction::WaitPool() {
 
 void irtkReconstruction::AddNid(ebbrt::Messenger::NetworkId nid) {
   _nids.push_back(nid);
+
+  cout << "Adding a network id, working on CPU " << ebbrt::Cpu::GetMine() << endl;
+
+  int cpu_num = ebbrt::Cpu::GetPhysCpus();
+  auto index = (cpu_num - (int)_nids.size()) % cpu_num;
+  auto cpu_i = ebbrt::Cpu::GetByIndex(index);
+  auto ctxt = cpu_i->get_context();
+
+  cout << "CPU: " << index << " was reserved for " << nid.ToString() << endl;  
+
+  _frontEnd_cpus_map.insert(make_pair(nid.ToString(), index));
+ 
+  ebbrt::event_manager->SpawnRemote([this, nid]() { Ping(nid); }, ctxt);
+ 
   if ((int) _nids.size() == _numBackendNodes) {
     _backendsAllocated.SetValue();
   }
 }
+
 
 /*
  * Fetal Reconstruction functions
@@ -334,25 +340,8 @@ void irtkReconstruction::ReturnFromSliceToVolumeRegistration(
 
 void irtkReconstruction::ReturnFromGatherTimers(
     ebbrt::IOBuf::DataPointer & dp) {
-  auto times = dp.Get<struct timers>();
-
-  _backendExecutionTimes.coeffInit += times.coeffInit;
-  _backendExecutionTimes.gaussianReconstruction += times.gaussianReconstruction;
-  _backendExecutionTimes.simulateSlices += times.simulateSlices;
-  _backendExecutionTimes.initializeRobustStatistics += 
-    times.initializeRobustStatistics;
-  _backendExecutionTimes.eStepI += times.eStepI;
-  _backendExecutionTimes.eStepII += times.eStepII;
-  _backendExecutionTimes.eStepIII += times.eStepIII;
-  _backendExecutionTimes.scale += times.scale;
-  _backendExecutionTimes.superResolution += times.superResolution;
-  _backendExecutionTimes.mStep += times.mStep;
-  _backendExecutionTimes.restoreSliceIntensities += 
-    times.restoreSliceIntensities;
-  _backendExecutionTimes.scaleVolume += times.scaleVolume;
-  _backendExecutionTimes.sliceToVolumeRegistration += 
-    times.sliceToVolumeRegistration;
-
+  auto phases = dp.Get<phases_data>();
+  _backend_performance.emplace_back(phases);
   ReturnFrom();
 }
 
@@ -919,7 +908,7 @@ void irtkReconstruction::MaskSlices() {
   }
 }
 
-int irtkReconstruction::GetTotalBytes() {
+uint64_t irtkReconstruction::GetTotalBytes() {
     return _totalBytes;
 }
 
@@ -991,7 +980,8 @@ void irtkReconstruction::InitializeEM() {
   }
 }
 
-void irtkReconstruction::Gather(string fn) {
+float irtkReconstruction::Gather(string fn) {
+  auto t = startTimer();
   _future = ebbrt::Promise<int>();
   auto f = _future.GetFuture();
   if (_debug)
@@ -1000,6 +990,7 @@ void irtkReconstruction::Gather(string fn) {
   f.Block();
   if (_debug)
     cout << fn << "(): Returned from future" << endl;
+  return endTimer(t);
 }
 
 void irtkReconstruction::MaskVolume() {
@@ -1016,111 +1007,47 @@ void irtkReconstruction::MaskVolume() {
     PrintImageSums("[MaskVolume output]");
 }
 
-void irtkReconstruction::InitializeTimers(struct timers& t) {
-  t.coeffInit = 0.0;
-  t.gaussianReconstruction = 0.0;
-  t.simulateSlices = 0.0;
-  t.initializeRobustStatistics = 0.0;
-  t.eStepI = 0.0;
-  t.eStepII = 0.0;
-  t.eStepIII = 0.0;
-  t.scale = 0.0;
-  t.superResolution = 0.0;
-  t.mStep = 0.0;
-  t.restoreSliceIntensities = 0.0;
-  t.scaleVolume = 0.0;
-  t.sliceToVolumeRegistration = 0.0;
-  t.totalExecutionTime = 0.0;
-}
-
 void irtkReconstruction::GatherFrontendTimers() {
-  TimeReport("Frontend", _executionTimes);
+  PrintPhasesData("fe", _phase_performance);
 }
 
 void irtkReconstruction::GatherBackendTimers() {
-  InitializeTimers(_backendExecutionTimes);
+
+  cout << "In GatherBackendTimers()" << endl;
+
   for (int i = 0; i < (int) _numBackendNodes; i++) {
+
+    auto index = _frontEnd_cpus_map[_nids[i].ToString()];   // get the cpu index
+    auto cpu_i = ebbrt::Cpu::GetByIndex(index);  // get the cpu
+    auto ctxt = cpu_i->get_context();  // context
+
+    ebbrt::event_manager->SpawnRemote([this, i, index]() {
+
     auto buf = MakeUniqueIOBuf(sizeof(int));
     auto dp = buf->GetMutDataPointer();
 
     dp.Get<int>() = GATHER_TIMERS; 
 
     _totalBytes += buf->ComputeChainDataLength();
+
+    cout << "Sending to network: " << _nids[i].ToString();
+    cout << " to core: " << index << " data of size: " << buf->ComputeChainDataLength() << endl;
     SendMessage(_nids[i], std::move(buf));
+    }, ctxt);
   }
 
   Gather("GatherBackendTimers");
 
-  _backendExecutionTimes.coeffInit = 
-    _backendExecutionTimes.coeffInit / _numBackendNodes;
-  _backendExecutionTimes.gaussianReconstruction = 
-    _backendExecutionTimes.gaussianReconstruction / _numBackendNodes;
-  _backendExecutionTimes.simulateSlices = 
-    _backendExecutionTimes.simulateSlices / _numBackendNodes;
-  _backendExecutionTimes.initializeRobustStatistics = 
-    _backendExecutionTimes.initializeRobustStatistics / _numBackendNodes;
-  _backendExecutionTimes.eStepI = 
-    _backendExecutionTimes.eStepI / _numBackendNodes;
-  _backendExecutionTimes.eStepII = 
-    _backendExecutionTimes.eStepII / _numBackendNodes;
-  _backendExecutionTimes.eStepIII = 
-    _backendExecutionTimes.eStepIII / _numBackendNodes;
-  _backendExecutionTimes.scale = 
-    _backendExecutionTimes.scale / _numBackendNodes;
-  _backendExecutionTimes.superResolution = 
-    _backendExecutionTimes.superResolution / _numBackendNodes;
-  _backendExecutionTimes.mStep = 
-    _backendExecutionTimes.mStep / _numBackendNodes;
-  _backendExecutionTimes.restoreSliceIntensities = 
-    _backendExecutionTimes.restoreSliceIntensities / _numBackendNodes;
-  _backendExecutionTimes.scaleVolume = 
-    _backendExecutionTimes.scaleVolume / _numBackendNodes;
-  _backendExecutionTimes.sliceToVolumeRegistration = 
-    _backendExecutionTimes.sliceToVolumeRegistration / _numBackendNodes;
-
-  TimeReport("Backend average", _backendExecutionTimes);
-}
-
-void irtkReconstruction::TimeReport(string component, struct timers& t) {
-  cout << endl;
-  cout << endl;
-  cout << "[" << component << " time] CoeffInit " 
-    << t.coeffInit << endl;
-  cout << "[" << component << " time] GaussianReconstruction " 
-    << t.gaussianReconstruction << endl;
-  cout << "[" << component << " time] SimulateSlices " 
-    << t.simulateSlices << endl;
-  cout << "[" << component << " time] InitializeRobustStatistics " 
-    << t.initializeRobustStatistics << endl;
-  cout << "[" << component << " time] EStepI " 
-    << t.eStepI << endl;
-  cout << "[" << component << " time] EStepII " 
-    << t.eStepII << endl;
-  cout << "[" << component << " time] EStepIII " 
-    << t.eStepIII << endl;
-  cout << "[" << component << " time] Scale " 
-    << t.scale << endl;
-  cout << "[" << component << " time] SuperResolution " 
-    << t.superResolution << endl;
-  cout << "[" << component << " time] MStep " 
-    << t.mStep << endl;
-  cout << "[" << component << " time] RestoreSliceIntensities " 
-    << t.restoreSliceIntensities << endl;
-  cout << "[" << component << " time] ScaleVolume " 
-    << t.scaleVolume << endl;
-  cout << "[" << component << " time] SliceToVolumeRegistration " 
-    << t.sliceToVolumeRegistration << endl;
-  cout << endl;
-  if (component == "Frontend") {
-    cout << "[Reconstruction loop time] " 
-      << t.totalExecutionTime << endl;
+  auto cnt = 0;
+  for( auto b : _backend_performance){
+    PrintPhasesData("be_"+std::to_string(cnt), b);
+    cnt++;
   }
 }
 
 void irtkReconstruction::Execute() {
 
-  InitializeTimers(_executionTimes);
-
+  cout << "In Execute() on CPU: " << ebbrt::Cpu::GetMine() << endl;
   auto start = startTimer();
 
   int recIterations;
@@ -1216,7 +1143,6 @@ void irtkReconstruction::Execute() {
   ScaleVolume();
 
   auto seconds = endTimer(start);
-  _executionTimes.totalExecutionTime = seconds;
     
   if (_debug) {
     cout << endl;
@@ -1268,6 +1194,9 @@ irtkReconstruction::CreateReconstructionParameters(int start, int end) {
 
 void irtkReconstruction::CoeffInitBootstrap(
     struct coeffInitParameters parameters) {
+
+  cout << "In CoeffInitBootstrap()" << endl;
+
   auto startTime = startTimer();
 
   int diff = _slices.size();
@@ -1276,16 +1205,23 @@ void irtkReconstruction::CoeffInitBootstrap(
   int end;
 
   for (int i = 0; i < (int) _numBackendNodes; i++) {
+
+    auto index = _frontEnd_cpus_map[_nids[i].ToString()];   // get the cpu index
+    auto cpu_i = ebbrt::Cpu::GetByIndex(index);  // get the cpu
+    auto ctxt = cpu_i->get_context();  // context
+
     start = i * factor;
     end = i * factor + factor;
     end = (end > diff) ? diff : end;
 
-    auto buf = MakeUniqueIOBuf((2 * sizeof(int)) + 
+    ebbrt::event_manager->SpawnRemote([this, i, index, start, end, parameters]() {
+
+    auto buf = MakeUniqueIOBuf((2 * sizeof(int)) +
         sizeof(struct coeffInitParameters) +
         sizeof(struct reconstructionParameters));
     auto dp = buf->GetMutDataPointer();
 
-    dp.Get<int>() = COEFF_INIT; 
+    dp.Get<int>() = COEFF_INIT;
     dp.Get<int>() = 1;
     dp.Get<struct coeffInitParameters>() = parameters;
 
@@ -1306,16 +1242,31 @@ void irtkReconstruction::CoeffInitBootstrap(
     buf->PrependChain(std::move(serializeTransformations(_transformations)));
     buf->PrependChain(std::move(sf));
     buf->PrependChain(std::move(si));
+
     _received = 0;
-    _totalBytes += buf->ComputeChainDataLength();
+
+    cout << "Sending to network: " << _nids[i].ToString();
+    cout << " to core: " << index << " data of size: " << buf->ComputeChainDataLength() << endl;
+    _phase_performance[COEFF_INIT].sent += buf->ComputeChainDataLength();
     SendMessage(_nids[i], std::move(buf));
+    }, ctxt);
   }
 }
+
 
 void irtkReconstruction::CoeffInit(struct coeffInitParameters parameters) {
   auto start = startTimer();
 
+  cout << "In CoeffInit([params])" << endl;
+
   for (int i = 0; i < (int) _numBackendNodes; i++) {
+
+    auto index = _frontEnd_cpus_map[_nids[i].ToString()];   // get the cpu index
+    auto cpu_i = ebbrt::Cpu::GetByIndex(index);  // get the cpu
+    auto ctxt = cpu_i->get_context();  // context
+
+    ebbrt::event_manager->SpawnRemote([this, i, parameters, index]() {
+
     auto buf = MakeUniqueIOBuf((2 * sizeof(int)) + 
         sizeof(struct coeffInitParameters));
     auto dp = buf->GetMutDataPointer();
@@ -1324,12 +1275,17 @@ void irtkReconstruction::CoeffInit(struct coeffInitParameters parameters) {
     dp.Get<int>() = 0;
     dp.Get<struct coeffInitParameters>() = parameters;
 
-    _totalBytes += buf->ComputeChainDataLength();
+    cout << "Sending to network: " << _nids[i].ToString();
+    cout << " to core: " << index << " data of size: " << buf->ComputeChainDataLength() << endl;
+    _phase_performance[COEFF_INIT].sent += buf->ComputeChainDataLength();
     SendMessage(_nids[i], std::move(buf));
+    }, ctxt);
   }
 }
 
 void irtkReconstruction::CoeffInit(int iteration) {
+
+  cout << "In CoeffInit([iter])" << endl;
 
   auto parameters = createCoeffInitParameters();
   bool initialize = iteration == 0;
@@ -1366,14 +1322,15 @@ void irtkReconstruction::GaussianReconstruction() {
   _volumeWeights.Initialize(_reconstructed.GetImageAttributes());
   _volumeWeights = 0;
 
-  Gather("CoeffInit & GaussianReconstruction");
+  _phase_performance[GAUSSIAN_RECONSTRUCTION].wait +=
+      Gather("CoeffInit & GaussianReconstruction");
 
   _reconstructed /= _volumeWeights;
 
   ExcludeSlicesWithOverlap();
 
   auto seconds = endTimer(start);
-  _executionTimes.gaussianReconstruction += seconds;
+  _phase_performance[GAUSSIAN_RECONSTRUCTION].time += seconds;
 
   if (_debug) {
     PrintImageSums("[GaussianReconstruction output]");
@@ -1386,7 +1343,16 @@ void irtkReconstruction::GaussianReconstruction() {
 void irtkReconstruction::SimulateSlices(bool initialize) {
   auto start = startTimer();
 
+  cout << "In SimulateSlices()" << endl;
+
   for (int i = 0; i < (int) _nids.size(); i++) {
+
+    auto index = _frontEnd_cpus_map[_nids[i].ToString()];   // get the cpu index
+    auto cpu_i = ebbrt::Cpu::GetByIndex(index);  // get the cpu
+    auto ctxt = cpu_i->get_context();  // context
+
+    ebbrt::event_manager->SpawnRemote([this, initialize, i, index]() {
+
     auto buf = MakeUniqueIOBuf(2*sizeof(int));
     auto dp = buf->GetMutDataPointer();
 
@@ -1394,8 +1360,11 @@ void irtkReconstruction::SimulateSlices(bool initialize) {
     dp.Get<int>() = (int) initialize;
     buf->PrependChain(std::move(serializeSlice(_reconstructed)));
 
-    _totalBytes += buf->ComputeChainDataLength();
+    cout << "Sending to network: " << _nids[i].ToString();
+    cout << " to core: " << index << " data of size: " << buf->ComputeChainDataLength() << endl;
+    _phase_performance[SIMULATE_SLICES].sent += buf->ComputeChainDataLength();
     SendMessage(_nids[i], std::move(buf));
+    }, ctxt);
   }
 }
 
@@ -1409,7 +1378,7 @@ void irtkReconstruction::MStep(int iteration) {
   _mMax = 0.0;
   _mNum = 0.0;
 
-  Gather("Simulate Slices & MStep");
+  _phase_performance[M_STEP].wait += Gather("Simulate Slices & MStep");
 
   if (_mMix > 0) {
     _sigmaCPU = _mSigma / _mMix;
@@ -1427,7 +1396,7 @@ void irtkReconstruction::MStep(int iteration) {
   _mCPU = 1 / (_mMax - _mMin);
 
   auto seconds = endTimer(start);
-  _executionTimes.mStep += seconds;
+  _phase_performance[M_STEP].time += seconds;
 
   if (_debug) {
     cout << "[MStep output] _sigmaCPU: " << _sigmaCPU << endl;
@@ -1439,16 +1408,28 @@ void irtkReconstruction::MStep(int iteration) {
 
 void irtkReconstruction::RestoreSliceIntensities() {
 
+  cout << "In RestoreSliceIntensities()" << endl;
+
   auto start = startTimer();
 
   for (int i = 0; i < (int) _nids.size(); i++) {
+
+    auto index = _frontEnd_cpus_map[_nids[i].ToString()];   // get the cpu index
+    auto cpu_i = ebbrt::Cpu::GetByIndex(index);  // get the cpu
+    auto ctxt = cpu_i->get_context();  // context
+
+    ebbrt::event_manager->SpawnRemote([this, i, index]() {
+
     auto buf = MakeUniqueIOBuf(sizeof(int));
     auto dp = buf->GetMutDataPointer();
 
     dp.Get<int>() = RESTORE_SLICE_INTENSITIES;
 
-    _totalBytes += buf->ComputeChainDataLength();
+    cout << "Sending to network: " << _nids[i].ToString();
+    cout << " to core: " << index << " data of size: " << buf->ComputeChainDataLength() << endl;
+    _phase_performance[RESTORE_SLICE_INTENSITIES].sent += buf->ComputeChainDataLength();
     SendMessage(_nids[i], std::move(buf));
+    }, ctxt);
   }
 }
 
@@ -1459,7 +1440,7 @@ void irtkReconstruction::ScaleVolume() {
   _num = 0;
   _den = 0;
 
-  Gather("ScaleVolume");
+  _phase_performance[SCALE_VOLUME].wait += Gather("ScaleVolume");
 
   double scale = _num / _den;
   irtkRealPixel *ptr = _reconstructed.GetPointerToVoxels();
@@ -1470,7 +1451,7 @@ void irtkReconstruction::ScaleVolume() {
   }
 
   auto seconds = endTimer(start);
-  _executionTimes.scaleVolume += seconds;
+  _phase_performance[SCALE_VOLUME].time += seconds;
 
   if (_debug) {
     PrintImageSums("[ScaleVolume output]");
@@ -1480,7 +1461,16 @@ void irtkReconstruction::ScaleVolume() {
 
 void irtkReconstruction::SliceToVolumeRegistration() {
 
+   auto start = startTimer();
+
    for (int i = 0; i < (int) _nids.size(); i++) {
+
+    auto index = _frontEnd_cpus_map[_nids[i].ToString()];   // get the cpu index
+    auto cpu_i = ebbrt::Cpu::GetByIndex(index);  // get the cpu
+    auto ctxt = cpu_i->get_context();  // context
+
+    ebbrt::event_manager->SpawnRemote([this, i, index]() {
+
     auto buf = MakeUniqueIOBuf(sizeof(int));
     auto dp = buf->GetMutDataPointer();
 
@@ -1488,12 +1478,18 @@ void irtkReconstruction::SliceToVolumeRegistration() {
 
     buf->PrependChain(std::move(serializeSlice(_reconstructed)));
 
-    _totalBytes += buf->ComputeChainDataLength();
+    cout << "Sending to network: " << _nids[i].ToString();
+    cout << " to core: " << index << " data of size: " << buf->ComputeChainDataLength() << endl;
+    _phase_performance[SLICE_TO_VOLUME_REGISTRATION].sent += buf->ComputeChainDataLength();
     SendMessage(_nids[i], std::move(buf));
+    }, ctxt);
   }
 
-  Gather("SliceToVolumeRegistration");
+  _phase_performance[GAUSSIAN_RECONSTRUCTION].wait +=
+      Gather("SliceToVolumeRegistration");
 
+  auto seconds = endTimer(start);
+  _phase_performance[GAUSSIAN_RECONSTRUCTION].time += seconds;
   if (_debug) {
     PrintImageSums("[SliceToVolumeRegistration output]");
   }
@@ -1506,7 +1502,8 @@ void irtkReconstruction::InitializeRobustStatistics() {
   _sigmaSum = 0;
   _numSum = 0;
 
-  Gather("Simulate Slices & InitializeRobustStatistics");
+  _phase_performance[INITIALIZE_ROBUST_STATISTICS].wait +=
+      Gather("Simulate Slices & InitializeRobustStatistics");
 
   _sigmaCPU = _sigmaSum / _numSum;
   _sigmaSCPU = 0.025;
@@ -1515,7 +1512,7 @@ void irtkReconstruction::InitializeRobustStatistics() {
   _mCPU = 1 / (2.1 * _maxIntensity - 1.9 * _minIntensity);
 
   auto seconds = endTimer(start);
-  _executionTimes.initializeRobustStatistics += seconds;
+  _phase_performance[INITIALIZE_ROBUST_STATISTICS].time += seconds;
 
   if (_debug) {
     PrintImageSums("[InitializeRobustStatistics output]");
@@ -1535,6 +1532,8 @@ void irtkReconstruction::EStepI() {
 
   auto start = startTimer();
 
+  cout << "In EStepI()" << endl;
+
   struct eStepParameters parameters;
 
   parameters.mCPU = _mCPU;
@@ -1549,6 +1548,13 @@ void irtkReconstruction::EStepI() {
   _mins = 1.0;
 
   for (int i = 0; i < (int) _nids.size(); i++) {
+
+    auto index = _frontEnd_cpus_map[_nids[i].ToString()];   // get the cpu index
+    auto cpu_i = ebbrt::Cpu::GetByIndex(index);  // get the cpu
+    auto ctxt = cpu_i->get_context();  // context
+
+    ebbrt::event_manager->SpawnRemote([this, parameters, i, index]() {
+
     auto buf = MakeUniqueIOBuf((2 * sizeof(int)) + 
         sizeof(struct eStepParameters));
     auto dp = buf->GetMutDataPointer();
@@ -1563,11 +1569,14 @@ void irtkReconstruction::EStepI() {
 
     buf->PrependChain(std::move(smallSlicesData));
 
-    _totalBytes += buf->ComputeChainDataLength();
+    cout << "Sending to network: " << _nids[i].ToString();
+    cout << " to core: " << index << " data of size: " << buf->ComputeChainDataLength() << endl;
+    _phase_performance[E_STEP_I].sent += buf->ComputeChainDataLength();
     SendMessage(_nids[i], std::move(buf));
+    }, ctxt);
   }
   
-  Gather("EStepI");
+  _phase_performance[E_STEP_I].wait += Gather("EStepI");
 
   if (_den > 0)
     _meanSCPU = _sum / _den;
@@ -1580,7 +1589,7 @@ void irtkReconstruction::EStepI() {
     _meanS2CPU = (_maxs + _meanSCPU) / 2;
 
   auto seconds = endTimer(start);
-  _executionTimes.eStepI += seconds;
+  _phase_performance[E_STEP_I].time += seconds;
 
   if (_debug) {
     cout << "[EStepI output] _sum: " << _sum << endl;
@@ -1599,6 +1608,8 @@ void irtkReconstruction::EStepII() {
 
   auto start = startTimer();
 
+  cout << "In EStepII()" << endl;
+
   _sum = 0.0;
   _den = 0.0;
   _den2 = 0.0;
@@ -1610,6 +1621,13 @@ void irtkReconstruction::EStepII() {
   parameters.meanS2CPU = _meanS2CPU;
 
   for (int i = 0; i < (int) _nids.size(); i++) {
+
+    auto index = _frontEnd_cpus_map[_nids[i].ToString()];   // get the cpu index
+    auto cpu_i = ebbrt::Cpu::GetByIndex(index);  // get the cpu
+    auto ctxt = cpu_i->get_context();  // context
+
+    ebbrt::event_manager->SpawnRemote([this, parameters, i, index]() {
+
     auto buf = MakeUniqueIOBuf(sizeof(int) + 
         sizeof(struct eStepParameters));
     auto dp = buf->GetMutDataPointer();
@@ -1617,11 +1635,14 @@ void irtkReconstruction::EStepII() {
     dp.Get<int>() = E_STEP_II;
     dp.Get<struct eStepParameters>() = parameters; 
 	
-    _totalBytes += buf->ComputeChainDataLength();
+    cout << "Sending to network: " << _nids[i].ToString();
+    cout << " to core: " << index << " data of size: " << buf->ComputeChainDataLength() << endl;
+    _phase_performance[E_STEP_II].sent += buf->ComputeChainDataLength();
     SendMessage(_nids[i], std::move(buf));
+    }, ctxt);
   }
 
-  Gather("EStepII");
+  _phase_performance[E_STEP_II].wait += Gather("EStepII");
 
   // [fetalRecontruction] do not allow too small sigma
   if ((_sum > 0) && (_den > 0)) {
@@ -1643,7 +1664,7 @@ void irtkReconstruction::EStepII() {
   }
 
   auto seconds = endTimer(start);
-  _executionTimes.eStepII += seconds;
+  _phase_performance[E_STEP_II].time += seconds;
 
   if (_debug) {
     cout << "[EStepII output] _sum: " << _sum << endl;
@@ -1660,6 +1681,8 @@ void irtkReconstruction::EStepIII() {
 
   auto start = startTimer();
 
+  cout << "In EStepIII()" << endl;
+
   _sum = 0.0;
   _num = 0.0;
 
@@ -1673,6 +1696,13 @@ void irtkReconstruction::EStepIII() {
   parameters.den = _den;
 
   for (int i = 0; i < (int) _nids.size(); i++) {
+
+    auto index = _frontEnd_cpus_map[_nids[i].ToString()];   // get the cpu index
+    auto cpu_i = ebbrt::Cpu::GetByIndex(index);  // get the cpu
+    auto ctxt = cpu_i->get_context();  // context
+
+    ebbrt::event_manager->SpawnRemote([this, parameters, i, index]() {
+
     auto buf = MakeUniqueIOBuf(sizeof(int) + 
         sizeof(struct eStepParameters));
     auto dp = buf->GetMutDataPointer();
@@ -1680,11 +1710,14 @@ void irtkReconstruction::EStepIII() {
     dp.Get<int>() = E_STEP_III;
     dp.Get<struct eStepParameters>() = parameters; 
 	
-    _totalBytes += buf->ComputeChainDataLength();
+    cout << "Sending to network: " << _nids[i].ToString();
+    cout << " to core: " << index << " data of size: " << buf->ComputeChainDataLength() << endl;
+    _phase_performance[E_STEP_III].sent += buf->ComputeChainDataLength();
     SendMessage(_nids[i], std::move(buf));
+    }, ctxt);
   }
 
-  Gather("EStepIII");
+  _phase_performance[E_STEP_III].wait += Gather("EStepIII");
 
   if (_num > 0)
     _mixSCPU = _sum / _num;
@@ -1692,7 +1725,7 @@ void irtkReconstruction::EStepIII() {
     _mixSCPU = 0.9;
 
   auto seconds = endTimer(start);
-  _executionTimes.eStepIII += seconds;
+  _phase_performance[E_STEP_III].time += seconds;
 
   if (_debug) {
     cout << "[EStepIII output] _sum: " << _sum << endl;
@@ -1713,20 +1746,32 @@ void irtkReconstruction::EStep() {
 void irtkReconstruction::Scale() {
   auto start = startTimer();
 
+  cout << "In Scale()" << endl;
+
   for (int i = 0; i < (int) _nids.size(); i++) {
+
+    auto index = _frontEnd_cpus_map[_nids[i].ToString()];   // get the cpu index
+    auto cpu_i = ebbrt::Cpu::GetByIndex(index);  // get the cpu
+    auto ctxt = cpu_i->get_context();  // context
+
+    ebbrt::event_manager->SpawnRemote([this, i, index]() {
+
     auto buf = MakeUniqueIOBuf(sizeof(int));
     auto dp = buf->GetMutDataPointer();
 
     dp.Get<int>() = SCALE;
 	
-    _totalBytes += buf->ComputeChainDataLength();
+    cout << "Sending to network: " << _nids[i].ToString();
+    cout << " to core: " << index << " data of size: " << buf->ComputeChainDataLength() << endl;
+    _phase_performance[SCALE].sent += buf->ComputeChainDataLength();
     SendMessage(_nids[i], std::move(buf));
+    }, ctxt);
   }
 
-  Gather("Scale");
+  _phase_performance[SCALE].wait += Gather("Scale");
 
   auto seconds = endTimer(start);
-  _executionTimes.scale += seconds;
+  _phase_performance[SCALE].time += seconds;
 
   if (_debug) 
     cout << "[Scale time] " << seconds << endl;
@@ -1908,6 +1953,8 @@ void irtkReconstruction::SuperResolution(int iteration) {
 
   auto start = startTimer();
 
+  cout << "In SuperResolution()" << endl;
+
   if (_debug) {
     cout << "[SuperResolution input] iteration: " << iteration << endl;
     cout << "[SuperResolution input] _alpha: " << _alpha << endl;
@@ -1927,17 +1974,27 @@ void irtkReconstruction::SuperResolution(int iteration) {
   irtkRealImage original = _reconstructed;
 
   for (int i = 0; i < (int) _nids.size(); i++) {
+
+    auto index = _frontEnd_cpus_map[_nids[i].ToString()];   // get the cpu index
+    auto cpu_i = ebbrt::Cpu::GetByIndex(index);  // get the cpu
+    auto ctxt = cpu_i->get_context();  // context
+
+    ebbrt::event_manager->SpawnRemote([this, iteration, i, index]() {
+
     auto buf = MakeUniqueIOBuf(2*sizeof(int));
     auto dp = buf->GetMutDataPointer();
 
     dp.Get<int>() = SUPERRESOLUTION;
     dp.Get<int>() = iteration;
 	
-    _totalBytes += buf->ComputeChainDataLength();
+    cout << "Sending to network: " << _nids[i].ToString();
+    cout << " to core: " << index << " data of size: " << buf->ComputeChainDataLength() << endl;
+    _phase_performance[SUPERRESOLUTION].sent += buf->ComputeChainDataLength();
     SendMessage(_nids[i], std::move(buf));
+    }, ctxt);
   }
 
-  Gather("SuperResolution");
+  _phase_performance[SUPERRESOLUTION].wait += Gather("SuperResolution");
 
   if (!_adaptive)
     for (int i = 0; i < _addon.GetX(); i++) {
@@ -1981,7 +2038,7 @@ void irtkReconstruction::SuperResolution(int iteration) {
   }
 
   auto seconds = endTimer(start);
-  _executionTimes.superResolution += seconds;
+  _phase_performance[SUPERRESOLUTION].time += seconds;
 
   if (_debug) {
     PrintImageSums("[SuperResolution output]");
@@ -2042,10 +2099,17 @@ void irtkReconstruction::SetSmoothingParameters(double lambda) {
  */
 void irtkReconstruction::ReceiveMessage(Messenger::NetworkId nid,
     std::unique_ptr<IOBuf> &&buffer) {
+  size_t cpu = ebbrt::Cpu::GetMine();
 
-  _totalBytes += buffer->ComputeChainDataLength();
+  cout << "Receiving message from: " << nid.ToString() << " data of size: " << buffer->ComputeChainDataLength();
+  cout << " on core: " << cpu << endl;
+
+  auto len = buffer->ComputeChainDataLength();
   auto dp = buffer->GetDataPointer();
   auto fn = dp.Get<int>();
+
+  if (fn < WORK_PHASES)
+    _phase_performance[fn].recv += len; 
 
   switch(fn) {
     case GAUSSIAN_RECONSTRUCTION:
@@ -2102,6 +2166,11 @@ void irtkReconstruction::ReceiveMessage(Messenger::NetworkId nid,
       {
         ReturnFromGatherTimers(dp);
         break;
+      }
+    case PING:
+      {
+          cout << "recevied a ping message" << endl;
+          break;
       }
     default:
       {

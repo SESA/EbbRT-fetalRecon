@@ -24,6 +24,8 @@ class irtkReconstruction : public ebbrt::Messagable<irtkReconstruction>,
   public irtkObject {
 
   private:
+    std::unordered_map<string, size_t> _frontEnd_cpus_map;   // maps str(ip) to cpu index
+
     // Ebb creation parameters 
     std::unordered_map<uint32_t, ebbrt::Promise<void>> _promise_map;
     std::mutex _m;
@@ -67,8 +69,8 @@ class irtkReconstruction : public ebbrt::Messagable<irtkReconstruction>,
     bool _debug; 
     bool _disableBiasCorr; 
 
-    struct timers _executionTimes;
-    struct timers _backendExecutionTimes;
+    phases_data _phase_performance;
+    std::vector<phases_data> _backend_performance;
 
     // Internal parameters
     ebbrt::Promise<void> _reconstructionDone;
@@ -109,7 +111,7 @@ class irtkReconstruction : public ebbrt::Messagable<irtkReconstruction>,
     int _tsigma;
     int _tmix;
     int _tnum;
-    int _totalBytes;
+    uint64_t _totalBytes;
     int _received;
     int _numSum;
 
@@ -174,7 +176,8 @@ class irtkReconstruction : public ebbrt::Messagable<irtkReconstruction>,
 
     static irtkReconstruction& HandleFault(ebbrt::EbbId id);
 
-    ebbrt::Future<void> Ping(ebbrt::Messenger::NetworkId nid);
+    //ebbrt::Future<void> Ping(ebbrt::Messenger::NetworkId nid);
+    void Ping(ebbrt::Messenger::NetworkId nid);
 
     // EbbRT-related functions
     void ReceiveMessage(ebbrt::Messenger::NetworkId nid,
@@ -233,7 +236,7 @@ class irtkReconstruction : public ebbrt::Messagable<irtkReconstruction>,
         const vector<irtkRealImage> &probability_maps = vector<irtkRealImage>()
         );
 
-    int GetTotalBytes();
+    uint64_t GetTotalBytes();
 
     void MaskSlices();
 
@@ -246,7 +249,7 @@ class irtkReconstruction : public ebbrt::Messagable<irtkReconstruction>,
     struct reconstructionParameters CreateReconstructionParameters(
         int start, int end);
 
-    void Gather(string fn);
+    float Gather(string fn);
 
     void ReturnFrom();
 
@@ -343,10 +346,6 @@ class irtkReconstruction : public ebbrt::Messagable<irtkReconstruction>,
     void GatherBackendTimers();
 
     void GatherFrontendTimers();
-
-    void TimeReport(string component, struct timers& t);
-
-    void InitializeTimers(struct timers& t);
 
     void Execute();
 
